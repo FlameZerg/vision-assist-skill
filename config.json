@@ -1,0 +1,8 @@
+{
+  "protocol": "openai",
+  "apihost": "https://api.mistral.ai",
+  "apikey": "6J7bDt2RQROyja0zIlH09TAsZBIGCCsf",
+  "model": "mistral-medium-latest",
+  "max_tokens": 8000,
+  "prompt": "You are an OCR assistant.\n\nExtract all visible text from the image and also describe any non-text elements (icons, shapes, arrows, objects, symbols, or emojis).\n\nFor each element, specify:\n- The exact text (for text) or a short description (for non-text).\n- For document-type content, please use markdown and latex format.\n- If there are objects like buildings or characters, try to identify who they are.\n- Its approximate position in the image (e.g., 'top left', 'center right', 'bottom middle').\n- Its spatial relationship to nearby elements (e.g., 'above', 'below', 'next to', 'on the left of').\n\nKeep the original reading order and layout structure as much as possible.\nDo not interpret or translate—only transcribe and describe what is visually present."
+}
