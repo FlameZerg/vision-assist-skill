@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # call_vision.sh — 为无 vision 能力的主模型调用第三方视觉 API
 # 支持双协议：openai(completions) / anthropic(messages)
-# 零依赖：curl + base64 + sed；python3 可用时优先用于 JSON 解析
+# 零依赖：curl + base64 + sed；探测到可用 Python 解释器时优先用于 JSON 解析
 # 用法：bash call_vision.sh <图片路径> [可选额外指令]
 
 set -euo pipefail
@@ -9,6 +9,48 @@ set -euo pipefail
 # 定位脚本与配置目录（CLAUDE_SKILL_DIR 由 Claude Code 注入，回退到脚本自身目录）
 SCRIPT_DIR="${CLAUDE_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 CONFIG_FILE="${SCRIPT_DIR}/config.json"
+
+# 将 POSIX 风格路径转换为原生 Windows 路径（供原生 Windows Python 读取；非 Windows 环境原样返回）
+to_native_path() {
+  local target="$1"
+  if command -v cygpath >/dev/null 2>&1 && [ -n "$target" ] && [ "${target#/}" != "$target" ]; then
+    cygpath -w "$target"
+  else
+    printf '%s' "$target"
+  fi
+}
+
+# 校验候选解释器是否真正可用：WindowsApps 下的 python3/python 是 Microsoft Store 占位符，
+# 被调用时会输出 "Python was not found" 并以非零码退出，必须实测排除而非只看 command -v
+is_python_usable() {
+  "$@" -c 'import json' >/dev/null 2>&1
+}
+
+# 选择可用的 Python 解释器：依次尝试 python3、python、Windows py 启动器与常见安装路径
+# 结果写入 PY_CMD 数组；数组为空表示环境无可用 Python，调用方回退 sed 解析
+PY_CMD=()
+select_python() {
+  local candidate exe
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && is_python_usable "$candidate"; then
+      PY_CMD=("$candidate")
+      return 0
+    fi
+  done
+  if command -v py >/dev/null 2>&1 && is_python_usable py -3; then
+    PY_CMD=(py -3)
+    return 0
+  fi
+  for exe in /c/Python*/python.exe "/c/Program Files/Python*/python.exe" "/c/Users/${USERNAME:-}/AppData/Local/Programs/Python/Python*/python.exe" /e/python/python.exe; do
+    [ -x "$exe" ] || continue
+    if is_python_usable "$exe"; then
+      PY_CMD=("$exe")
+      return 0
+    fi
+  done
+  return 1
+}
+select_python || PY_CMD=()
 
 # 校验图片路径参数
 if [ "$#" -lt 1 ]; then
@@ -33,23 +75,28 @@ fi
 
 # JSON 字符串转义（用于安全嵌入文本字段，处理双引号与反斜杠）
 json_escape() {
-  # 优先用 python3 进行精确转义；不可用时用 sed 做基本转义
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null | sed 's/^"//; s/"$//'
+  # 优先用探测到的 Python 解释器进行精确转义；不可用时用 sed 做基本转义
+  if [ "${#PY_CMD[@]}" -gt 0 ]; then
+    "${PY_CMD[@]}" -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null | sed 's/^"//; s/"$//'
   else
     sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g'
   fi
 }
 
-# 读取配置字段（python3 优先，sed 兜底）
+# 读取配置字段（Python 优先，sed 兜底）
 read_config() {
   local key="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import json; print(json.load(open(r'$CONFIG_FILE',encoding='utf-8')).get('$key',''))" 2>/dev/null
-  else
-    # sed 兜底：同时匹配字符串值 "key":"value" 与数值/布尔值 "key":2000
-    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p; s/.*\"$key\"[[:space:]]*:[[:space:]]*\([0-9a-zA-Z.+-]*\)[[:space:]]*[,}].*/\1/p" "$CONFIG_FILE" | head -1
+  # 优先用探测到的 Python 解释器读取配置
+  if [ "${#PY_CMD[@]}" -gt 0 ]; then
+    local value
+    value="$("${PY_CMD[@]}" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get(sys.argv[2],''))" "$(to_native_path "$CONFIG_FILE")" "$key" 2>/dev/null)"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
   fi
+  # sed 兜底：同时匹配字符串值 "key":"value" 与数值/布尔值 "key":2000
+  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p; s/.*\"$key\"[[:space:]]*:[[:space:]]*\([0-9a-zA-Z.+-]*\)[[:space:]]*[,}].*/\1/p" "$CONFIG_FILE" | head -1
 }
 
 # 读取配置（数值与非数值统一处理）
@@ -150,13 +197,14 @@ if [ "$HTTP_CODE" != "200" ]; then
   exit 1
 fi
 
-# 提取视觉描述文本（python3 优先精确解析，sed 兜底）
+# 提取视觉描述文本（Python 优先精确解析，sed 兜底）
 extract_content() {
   local resp="$1"
   local proto="$2"
-  if command -v python3 >/dev/null 2>&1; then
+  # 优先用探测到的 Python 解释器精确解析
+  if [ "${#PY_CMD[@]}" -gt 0 ]; then
     if [ "$proto" = "openai" ]; then
-      printf '%s' "$resp" | python3 -c '
+      printf '%s' "$resp" | "${PY_CMD[@]}" -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
@@ -166,7 +214,7 @@ except Exception as e:
     sys.exit(1)
 ' 2>/dev/null
     else
-      printf '%s' "$resp" | python3 -c '
+      printf '%s' "$resp" | "${PY_CMD[@]}" -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
